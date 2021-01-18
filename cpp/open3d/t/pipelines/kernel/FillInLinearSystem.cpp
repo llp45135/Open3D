@@ -81,6 +81,67 @@ void FillInRigidAlignmentTerm(core::Tensor &AtA,
     }
 }
 
+void FillInSLACAlignmentTerm(core::Tensor &AtA,
+                             core::Tensor &Atb,
+                             core::Tensor &residual,
+                             const core::Tensor &points_i,
+                             const core::Tensor &points_j,
+                             const core::Tensor &normals_i,
+                             core::Tensor &cgrid_nb_indices_i,
+                             core::Tensor &cgrid_nb_indices_j,
+                             core::Tensor &cgrid_nb_interp_ratios_i,
+                             core::Tensor &cgrid_nb_interp_ratios_j,
+                             core::Tensor &cgrid_positions,
+                             core::Tensor &R_i_transpose,
+                             core::Tensor &R_j_transpose,
+                             int i,
+                             int j) {
+    AtA.AssertDtype(core::Dtype::Float32);
+    Atb.AssertDtype(core::Dtype::Float32);
+    residual.AssertDtype(core::Dtype::Float32);
+    points_i.AssertDtype(core::Dtype::Float32);
+    points_j.AssertDtype(core::Dtype::Float32);
+    normals_i.AssertDtype(core::Dtype::Float32);
+
+    core::Device device = AtA.GetDevice();
+    if (Atb.GetDevice() != device) {
+        utility::LogError("AtA should have the same device as Atb.");
+    }
+    if (points_i.GetDevice() != device) {
+        utility::LogError(
+                "Points i should have the same device as the linear system.");
+    }
+    if (points_j.GetDevice() != device) {
+        utility::LogError(
+                "Points j should have the same device as the linear system.");
+    }
+    if (normals_i.GetDevice() != device) {
+        utility::LogError(
+                "Normals i should have the same device as the linear system.");
+    }
+
+    core::Device::DeviceType device_type = device.GetType();
+    if (device_type == core::Device::DeviceType::CPU) {
+        FillInSLACAlignmentTermCPU(AtA, Atb, residual, points_i, points_j,
+                                   normals_i, cgrid_nb_indices_i,
+                                   cgrid_nb_indices_j, cgrid_nb_interp_ratios_i,
+                                   cgrid_nb_interp_ratios_j, cgrid_positions,
+                                   R_i_transpose, R_j_transpose, i, j);
+    } else if (device_type == core::Device::DeviceType::CUDA) {
+#ifdef BUILD_CUDA_MODULE
+        FillInSLACAlignmentTermCUDA(
+                AtA, Atb, residual, points_i, points_j, normals_i,
+                cgrid_nb_indices_i, cgrid_nb_indices_j,
+                cgrid_nb_interp_ratios_i, cgrid_nb_interp_ratios_j,
+                cgrid_positions, R_i_transpose, R_j_transpose, i, j);
+
+#else
+        utility::LogError("Not compiled with CUDA, but CUDA device is used.");
+#endif
+    } else {
+        utility::LogError("Unimplemented device");
+    }
+}
 }  // namespace kernel
 }  // namespace pipelines
 }  // namespace t

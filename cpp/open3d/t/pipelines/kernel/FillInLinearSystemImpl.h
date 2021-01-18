@@ -151,6 +151,144 @@ void FillInRigidAlignmentTermCPU
     // Atb_sub = Atb.IndexGet({indices});
     // utility::LogInfo("Atb_sub after = {}", Atb_sub.ToString());
 }
+
+#if defined(BUILD_CUDA_MODULE) && defined(__CUDACC__)
+void FillInSLACAlignmentTermCUDA
+#else
+void FillInSLACAlignmentTermCPU
+#endif
+        (core::Tensor &AtA,
+         core::Tensor &Atb,
+         core::Tensor &residual,
+         const core::Tensor &points_i,
+         const core::Tensor &points_j,
+         const core::Tensor &normals_i,
+         core::Tensor &cgrid_nb_indices_i,
+         core::Tensor &cgrid_nb_indices_j,
+         core::Tensor &cgrid_nb_interp_ratios_i,
+         core::Tensor &cgrid_nb_interp_ratios_j,
+         core::Tensor &cgrid_positions,
+         core::Tensor &R_i_transpose,
+         core::Tensor &R_j_transpose,
+         int i,
+         int j) {
+    core::Device device = AtA.GetDevice();
+    int64_t n = points_i.GetLength();
+    if (points_j.GetLength() != n || normals_i.GetLength() != n) {
+        utility::LogError(
+                "Unable to setup linear system: input length mismatch.");
+    }
+
+    // Now the fill-in can be tricky, we have to directly fill-in the large
+    // matrix, as variable per correspondence is different.
+    float *AtA_ptr = static_cast<float *>(AtA.GetDataPtr());
+    float *Atb_ptr = static_cast<float *>(Atb.GetDataPtr());
+    float *residual_ptr = static_cast<float *>(residual.GetDataPtr());
+
+    const float *points_i_ptr =
+            static_cast<const float *>(points_i.GetDataPtr());
+    const float *points_j_ptr =
+            static_cast<const float *>(points_j.GetDataPtr());
+    const float *normals_i_ptr =
+            static_cast<const float *>(normals_i.GetDataPtr());
+
+#if defined(BUILD_CUDA_MODULE) && defined(__CUDACC__)
+    core::kernel::CUDALauncher launcher;
+#else
+    core::kernel::CPULauncher launcher;
+#endif
+    launcher.LaunchGeneralKernel(n, [=] OPEN3D_DEVICE(int64_t workload_idx) {
+        const float *point_i = points_i_ptr + 3 * workload_idx;
+        const float *point_j = points_j_ptr + 3 * workload_idx;
+        const float *normal_i = normals_i_ptr + 3 * workload_idx;
+
+        float r = (point_i[0] - point_j[0]) * normal_i[0] +
+                  (point_i[1] - point_j[1]) * normal_i[1] +
+                  (point_i[2] - point_j[2]) * normal_i[2];
+
+        float J_ij[40];
+
+        // For poses
+        J_ij[0] = -point_j[2] * normal_i[1] + point_j[1] * normal_i[2];
+        J_ij[1] = point_j[2] * normal_i[0] - point_j[0] * normal_i[2];
+        J_ij[2] = -point_j[1] * normal_i[0] + point_j[0] * normal_i[1];
+        J_ij[3] = normal_i[0];
+        J_ij[4] = normal_i[1];
+        J_ij[5] = normal_i[2];
+        for (int k = 0; k < 6; ++k) {
+            J_ij[k + 6] = -J_ij[k];
+        }
+        // For control grids
+        for (int k = 0; k < 8; ++k) {
+            // For i
+            J_ij[k * 3 + 0 + 12 + 0];
+            J_ij[k * 3 + 1 + 12 + 0];
+            J_ij[k * 3 + 2 + 12 + 0];
+            // For j
+            J_ij[k * 3 + 0 + 12 + 24];
+            J_ij[k * 3 + 1 + 12 + 24];
+            J_ij[k * 3 + 2 + 12 + 24];
+        }
+
+        // Not optimized; Switch to reduction if necessary.
+#if defined(BUILD_CUDA_MODULE) && defined(__CUDACC__)
+        for (int i_local = 0; i_local < 12; ++i_local) {
+            for (int j_local = 0; j_local < 12; ++j_local) {
+                atomicAdd(&AtA_local_ptr[i_local * 12 + j_local],
+                          J_ij[i_local] * J_ij[j_local]);
+            }
+            atomicAdd(&Atb_local_ptr[i_local], J_ij[i_local] * r);
+        }
+        atomicAdd(residual_ptr, r * r);
+#else
+#pragma omp critical
+        {
+            for (int i_local = 0; i_local < 12; ++i_local) {
+                for (int j_local = 0; j_local < 12; ++j_local) {
+                    AtA_local_ptr[i_local * 12 + j_local]
+                      += J_ij[i_local] * J_ij[j_local];
+                 }
+                 Atb_local_ptr[i_local] += J_ij[i_local] * r;
+            }
+            *residual_ptr += r * r;
+        }
+#endif
+
+        for (int ctr_i = 0; ctr_i < 8; ++ctr_i) {
+        }
+
+        for (int ctr_j = 0; ctr_j < 8; ++ctr_j) {
+        }
+    });
+    // Then fill-in the large linear system
+    std::vector<int64_t> indices_vec(12);
+    for (int k = 0; k < 6; ++k) {
+        indices_vec[k] = i * 6 + k;
+        indices_vec[k + 6] = j * 6 + k;
+    }
+
+    std::vector<int64_t> indices_i_vec;
+    std::vector<int64_t> indices_j_vec;
+    for (int local_i = 0; local_i < 12; ++local_i) {
+        for (int local_j = 0; local_j < 12; ++local_j) {
+            indices_i_vec.push_back(indices_vec[local_i]);
+            indices_j_vec.push_back(indices_vec[local_j]);
+        }
+    }
+
+    core::Tensor indices(indices_vec, {12}, core::Dtype::Int64, device);
+    core::Tensor indices_i(indices_i_vec, {12 * 12}, core::Dtype::Int64,
+                           device);
+    core::Tensor indices_j(indices_j_vec, {12 * 12}, core::Dtype::Int64,
+                           device);
+
+    core::Tensor AtA_sub = AtA.IndexGet({indices_i, indices_j});
+    AtA.IndexSet({indices_i, indices_j}, AtA_sub + AtA_local.View({12 * 12}));
+
+    core::Tensor Atb_sub = Atb.IndexGet({indices});
+    Atb.IndexSet({indices}, Atb_sub + Atb_local.View({12, 1}));
+}
+
 }  // namespace kernel
 }  // namespace pipelines
 }  // namespace t
